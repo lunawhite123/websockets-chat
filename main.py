@@ -14,31 +14,33 @@ app = FastAPI()
 class ConnectionManager:
     def __init__(self):
         self.websockets: dict[WebSocket:str] = {}
+        self.usernames_to_websockets = dict[str: websocket] = {}
     
 
     async def connect(self, websocket: WebSocket, username: str):
         await websocket.accept()
         self.websockets[websocket] = username
+        self.usernames_to_websockets[username] = websocket
     
-    async def disconnect(self, websocket: WebSocket):
+    async def disconnect(self, websocket: WebSocket, username: str):
         del self.websockets[websocket]
-
+        del self.usernames_to_websockets[username]
     @staticmethod
     async def send_personal_message(message: str, websocket: WebSocket):
         await websocket.send_text(message)
     
-    async def broadcast(self, message: str):
+    async def broadcast(self, message: str, username: str):
         for socket in self.websockets.keys():
             try:
                 await socket.send_text(message)
 
             except RuntimeError as e:
                 print(f'Ошибка при отправке сообщения (возможно отключился) {e}')
-                await self.websockets.disconnect(websocket)
+                await self.websockets.disconnect(websocket, username)
 
             except Exception as e:
                 print(f'Ошибка при отправке сообщения {e}')
-                await self.websockets.disconnect(websocket)
+                await self.websockets.disconnect(websocket, username)
 
 manager = ConnectionManager()
 
@@ -72,7 +74,7 @@ async def websocket(websocket: WebSocket, db: AsyncSession = Depends(get_db)):
             await manager.broadcast(completed_message)
 
     except WebSocketDisconnect:
-        await manager.disconnect(websocket=websocket)
+        await manager.disconnect(websocket=websocket, username=user.username)
 
 @app.on_event("startup")
 async def startup() -> None:
