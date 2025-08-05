@@ -8,39 +8,56 @@ from models import User
 from database import engine, Base, get_db
 from schemas import UserCreate, Token, UserResponse
 from auth import hash_password, verify_password, create_token, get_current_user, decode_token
+import json
 
 app = FastAPI()
 
 class ConnectionManager:
     def __init__(self):
-        self.websockets: dict[WebSocket:str] = {}
-        self.usernames_to_websockets = dict[str: websocket] = {}
+        self.websockets: dict[WebSocket, str] = {}
+        self.usernames_to_websockets: dict[str, WebSocket] = {}
     
-
     async def connect(self, websocket: WebSocket, username: str):
         await websocket.accept()
         self.websockets[websocket] = username
         self.usernames_to_websockets[username] = websocket
     
-    async def disconnect(self, websocket: WebSocket, username: str):
-        del self.websockets[websocket]
-        del self.usernames_to_websockets[username]
-    @staticmethod
-    async def send_personal_message(message: str, websocket: WebSocket):
-        await websocket.send_text(message)
+    async def disconnect(self, websocket: WebSocket):
+        if websocket in self.websockets:
+            username = self.websockets.pop(websocket)
+            
+            if username in self.usernames_to_websockets:
+                del self.usernames_to_websockets[username]
     
-    async def broadcast(self, message: str, username: str):
-        for socket in self.websockets.keys():
+    async def send_private_message(self, message: str, username: str):
+        websocket = self.usernames_to_websockets.get(username)
+        
+        if websocket:
+            try:
+                await websocket.send_text(message)
+            
+            except RuntimeError as e:
+                print(f'Ошибка при отправке сообщения (возможно не в сети) {e}')
+                await self.disconnect(websocket)
+
+            except Exception as e:
+                print(f'Ошибка при отправке сообщения {e}')
+                await self.disconnect(websocket)
+        else:
+            print(f'Сообщение не отправлено, получатель {username} не найден или не в сети!')
+    
+    async def broadcast(self, message: str):
+        for socket in list(self.websockets.keys()):
             try:
                 await socket.send_text(message)
 
             except RuntimeError as e:
                 print(f'Ошибка при отправке сообщения (возможно отключился) {e}')
-                await self.websockets.disconnect(websocket, username)
+                await self.disconnect(socket)
 
             except Exception as e:
                 print(f'Ошибка при отправке сообщения {e}')
-                await self.websockets.disconnect(websocket, username)
+                await self.disconnect(socket)
 
 manager = ConnectionManager()
 
@@ -65,16 +82,31 @@ async def websocket(websocket: WebSocket, db: AsyncSession = Depends(get_db)):
         print(f"WebSocket: Отклонено - ошибка аутентификации: {e.detail}")
         return 
 
-    
     await manager.connect(websocket, user.username)
+    
     try:
         while True:
-            message = await websocket.receive_text()
-            completed_message = f'Пользователь {user.username}: {message}'
-            await manager.broadcast(completed_message)
+            try:
+                json_data = await websocket.receive_text()
+                message = json.loads(json_data)
+                completed_message = f'Пользователь {user.username}: {message['data']}'
+                
+                if message['type'] == 'broadcast':
+                    await manager.broadcast(completed_message)
+                elif message['type'] == 'private':
+                    await manager.send_private_message(completed_message, message['recipient'])
+            except json.JSONDecodeError as e:
+                print(f'Неверная информация в json {e}')
+    
+            except KeyError as e:
+                print(f'Отсутствует необходимая информация в json {e}')
+                continue
 
-    except WebSocketDisconnect:
-        await manager.disconnect(websocket=websocket, username=user.username)
+    except WebSocketDisconnect as e:
+        await manager.disconnect(websocket=websocket)
+        print(f'Пользователь вышел {e}')
+    
+    
 
 @app.on_event("startup")
 async def startup() -> None:

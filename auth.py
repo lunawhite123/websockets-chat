@@ -9,14 +9,17 @@ from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import timedelta, datetime, timezone
 import secrets
+from dotenv import load_dotenv
 
 from database import get_db
 from models import User
 from schemas import Token
+import os
 
+load_dotenv()
 pwd_context = CryptContext(schemes=['sha256_crypt'], deprecated='auto')
 
-SECRET_KEY = secrets.token_urlsafe(32)
+SECRET_KEY = os.getenv('SECRET_KEY')
 ALGORITHM = 'HS256'
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 
