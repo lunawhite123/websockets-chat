@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 
 from database import get_db
 from models import User
-from schemas import Token
 import os
 
 load_dotenv()
@@ -66,11 +65,6 @@ async def decode_token(token: str, db = AsyncSession) -> User:
     if user is None:
         raise credentials_exception
     return user
-
-    
-
-
-
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)) -> User:
     credentials_exception = HTTPException(

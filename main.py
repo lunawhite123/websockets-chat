@@ -4,7 +4,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from models import User
+from models import User, Message
 from database import engine, Base, get_db
 from schemas import UserCreate, Token, UserResponse
 from auth import hash_password, verify_password, create_token, get_current_user, decode_token
@@ -14,55 +14,80 @@ app = FastAPI()
 
 class ConnectionManager:
     def __init__(self):
-        self.websockets: dict[WebSocket, str] = {}
+        self.websockets: dict[str, dict[WebSocket, str]] = {}
         self.usernames_to_websockets: dict[str, WebSocket] = {}
     
-    async def connect(self, websocket: WebSocket, username: str):
+    async def connect(self, websocket: WebSocket, username: str, room: str):
         await websocket.accept()
-        self.websockets[websocket] = username
+        
+        if not room in self.websockets:
+            self.websockets[room] = {}
+        
+        self.websockets[room][websocket] = username
         self.usernames_to_websockets[username] = websocket
     
-    async def disconnect(self, websocket: WebSocket):
-        if websocket in self.websockets:
-            username = self.websockets.pop(websocket)
+    async def disconnect(self, websocket: WebSocket, room: str):
+        if room in self.websockets and websocket in self.websockets[room]:
+            username = self.websockets[room].pop(websocket)
             
             if username in self.usernames_to_websockets:
                 del self.usernames_to_websockets[username]
-    
-    async def send_private_message(self, message: str, username: str):
-        websocket = self.usernames_to_websockets.get(username)
         
+            if not self.websockets[room]:
+                del self.websockets[room]
+    
+    async def send_private_message(self, message: str, recipient: str, sender: str, room: str):
+        if not room in self.websockets:
+            print('Указаная комната не существует')
+            return (None, 'Указаная комната не существует')
+        
+        if not recipient in self.websockets[room].values() or not sender in self.websockets[room].values():
+            print('Отправитель и получатель должны находится в одной комнате для отправки сообщений')
+            return (None, 'Отправитель и получатель должны находится в одной комнате для отправки сообщений')
+
+        websocket = self.usernames_to_websockets.get(recipient)
         if websocket:
             try:
                 await websocket.send_text(message)
-            
+                
             except RuntimeError as e:
                 print(f'Ошибка при отправке сообщения (возможно не в сети) {e}')
-                await self.disconnect(websocket)
+                await self.disconnect(websocket, room)
+                return (None, 'Пользователь не в сети')
 
             except Exception as e:
                 print(f'Ошибка при отправке сообщения {e}')
-                await self.disconnect(websocket)
+                await self.disconnect(websocket, room)
+                return (None, 'Ошибка при отправке сообщения')
         else:
-            print(f'Сообщение не отправлено, получатель {username} не найден или не в сети!')
+            print(f'Сообщение не отправлено, получатель {recipient} не найден или не в сети!')
+            return (None, f'Сообщение не отправлено, получатель {recipient} не найден или не в сети!')
+        return (True, "Сообщение успешно отправлено")
     
-    async def broadcast(self, message: str):
-        for socket in list(self.websockets.keys()):
+    async def broadcast(self, message: str, room: str):
+        if not room in self.websockets:
+            print('Указаная комната не существует')
+            return (None, 'Указаная комната не существует')
+        
+        for socket in list(self.websockets[room].keys()):
             try:
                 await socket.send_text(message)
 
             except RuntimeError as e:
                 print(f'Ошибка при отправке сообщения (возможно отключился) {e}')
-                await self.disconnect(socket)
+                await self.disconnect(socket, room)
+                return (None, f'Ошибка при отправке сообщения (возможно отключился) {e}')
 
             except Exception as e:
                 print(f'Ошибка при отправке сообщения {e}')
-                await self.disconnect(socket)
+                await self.disconnect(socket, room)
+                return (None, f'Ошибка при отправке сообщения (возможно отключился) {e}')
+        return (True, "Сообщение успешно отправлено")
 
 manager = ConnectionManager()
 
-@app.websocket('/ws')
-async def websocket(websocket: WebSocket, db: AsyncSession = Depends(get_db)):
+@app.websocket('/ws/{room}')
+async def websocket(websocket: WebSocket, room: str, db: AsyncSession = Depends(get_db)):
     header = websocket.headers.get('Authorization')
     if not header or not header.lower().startswith('bearer '):
         await websocket.close(
@@ -82,7 +107,7 @@ async def websocket(websocket: WebSocket, db: AsyncSession = Depends(get_db)):
         print(f"WebSocket: Отклонено - ошибка аутентификации: {e.detail}")
         return 
 
-    await manager.connect(websocket, user.username)
+    await manager.connect(websocket, user.username, room=room)
     
     try:
         while True:
@@ -92,22 +117,30 @@ async def websocket(websocket: WebSocket, db: AsyncSession = Depends(get_db)):
                 completed_message = f'Пользователь {user.username}: {message['data']}'
                 
                 if message['type'] == 'broadcast':
-                    await manager.broadcast(completed_message)
+                    success = await manager.broadcast(completed_message, room)
+                    if not success[0]:
+                        await websocket.send_text(json.dumps({'status': 'error', 'message': success[1]}))
+                
                 elif message['type'] == 'private':
-                    await manager.send_private_message(completed_message, message['recipient'])
+                    success = await manager.send_private_message(completed_message, message['recipient'], user.username, room=room)
+                    if not success[0]:
+                        await websocket.send_text(json.dumps({'status': 'error', 'message': success[1]}))
+                    
+            
             except json.JSONDecodeError as e:
                 print(f'Неверная информация в json {e}')
-    
+                await websocket.send_text(json.dumps({'status': 'error', 'message': f'Неверный JSON: {e}'}))
+                continue 
+            
             except KeyError as e:
                 print(f'Отсутствует необходимая информация в json {e}')
+                await websocket.send_text(json.dumps({'status': 'error', 'message': f'Отсутствует необходимая информация в json {e}'}))
                 continue
 
     except WebSocketDisconnect as e:
-        await manager.disconnect(websocket=websocket)
+        await manager.disconnect(websocket=websocket, room=room)
         print(f'Пользователь вышел {e}')
     
-    
-
 @app.on_event("startup")
 async def startup() -> None:
     async with engine.begin() as conn:
